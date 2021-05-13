@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/querier/frontend"
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 
@@ -29,7 +28,7 @@ const (
 )
 
 // NewTripperware returns a Tripperware which sends requests to different sub tripperwares based on the query type.
-func NewTripperware(config Config, reg prometheus.Registerer, logger log.Logger) (frontend.Tripperware, error) {
+func NewTripperware(config Config, reg prometheus.Registerer, logger log.Logger) (queryrange.Tripperware, error) {
 	var (
 		queryRangeLimits, labelsLimits queryrange.Limits
 		err                            error
@@ -132,15 +131,15 @@ func getOperation(r *http.Request) string {
 }
 
 // newQueryRangeTripperware returns a Tripperware for range queries configured with middlewares of
-// limit, step align, split by interval, cache requests and retry.
+// limit, step align, downsampled, split by interval, cache requests and retry.
 func newQueryRangeTripperware(
 	config QueryRangeConfig,
 	limits queryrange.Limits,
 	codec *queryRangeCodec,
 	reg prometheus.Registerer,
 	logger log.Logger,
-) (frontend.Tripperware, error) {
-	queryRangeMiddleware := []queryrange.Middleware{queryrange.LimitsMiddleware(limits)}
+) (queryrange.Tripperware, error) {
+	queryRangeMiddleware := []queryrange.Middleware{queryrange.NewLimitsMiddleware(limits)}
 	m := queryrange.NewInstrumentMiddlewareMetrics(reg)
 
 	// step align middleware.
@@ -149,6 +148,14 @@ func newQueryRangeTripperware(
 			queryRangeMiddleware,
 			queryrange.InstrumentMiddleware("step_align", m),
 			queryrange.StepAlignMiddleware,
+		)
+	}
+
+	if config.RequestDownsampled {
+		queryRangeMiddleware = append(
+			queryRangeMiddleware,
+			queryrange.InstrumentMiddleware("downsampled", m),
+			DownsampledMiddleware(codec, reg),
 		)
 	}
 
@@ -197,7 +204,7 @@ func newQueryRangeTripperware(
 
 	return func(next http.RoundTripper) http.RoundTripper {
 		rt := queryrange.NewRoundTripper(next, codec, queryRangeMiddleware...)
-		return frontend.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return queryrange.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
 			return rt.RoundTrip(r)
 		})
 	}, nil
@@ -211,7 +218,7 @@ func newLabelsTripperware(
 	codec *labelsCodec,
 	reg prometheus.Registerer,
 	logger log.Logger,
-) (frontend.Tripperware, error) {
+) (queryrange.Tripperware, error) {
 	labelsMiddleware := []queryrange.Middleware{}
 	m := queryrange.NewInstrumentMiddlewareMetrics(reg)
 
@@ -259,7 +266,7 @@ func newLabelsTripperware(
 	}
 	return func(next http.RoundTripper) http.RoundTripper {
 		rt := queryrange.NewRoundTripper(next, codec, labelsMiddleware...)
-		return frontend.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return queryrange.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
 			return rt.RoundTrip(r)
 		})
 	}, nil

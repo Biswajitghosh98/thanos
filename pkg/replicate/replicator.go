@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	thanosmodel "github.com/thanos-io/thanos/pkg/model"
+
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/run"
@@ -80,6 +82,8 @@ func RunReplicate(
 	fromObjStoreConfig *extflag.PathOrContent,
 	toObjStoreConfig *extflag.PathOrContent,
 	singleRun bool,
+	minTime, maxTime *thanosmodel.TimeOrDurationValue,
+	blockIDs []ulid.ULID,
 ) error {
 	logger = log.With(logger, "component", "replicate")
 
@@ -161,7 +165,15 @@ func RunReplicate(
 	replicationRunDuration.WithLabelValues(labelSuccess)
 	replicationRunDuration.WithLabelValues(labelError)
 
-	fetcher, err := thanosblock.NewMetaFetcher(logger, 32, fromBkt, "", reg, nil, nil)
+	fetcher, err := thanosblock.NewMetaFetcher(
+		logger,
+		32,
+		fromBkt,
+		"",
+		reg,
+		[]thanosblock.MetadataFilter{thanosblock.NewTimePartitionMetaFilter(*minTime, *maxTime)},
+		nil,
+	)
 	if err != nil {
 		return errors.Wrapf(err, "create meta fetcher with bucket %v", fromBkt)
 	}
@@ -171,6 +183,7 @@ func RunReplicate(
 		labelSelector,
 		resolutions,
 		compactions,
+		blockIDs,
 	).Filter
 	metrics := newReplicationMetrics(reg)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -179,12 +192,12 @@ func RunReplicate(
 		timestamp := time.Now()
 		entropy := ulid.Monotonic(rand.New(rand.NewSource(timestamp.UnixNano())), 0)
 
-		ulid, err := ulid.New(ulid.Timestamp(timestamp), entropy)
+		runID, err := ulid.New(ulid.Timestamp(timestamp), entropy)
 		if err != nil {
 			return errors.Wrap(err, "generate replication run-id")
 		}
 
-		logger := log.With(logger, "replication-run-id", ulid.String())
+		logger := log.With(logger, "replication-run-id", runID.String())
 		level.Info(logger).Log("msg", "running replication attempt")
 
 		if err := newReplicationScheme(logger, metrics, blockFilter, fetcher, fromBkt, toBkt, reg).execute(ctx); err != nil {
@@ -198,7 +211,7 @@ func RunReplicate(
 		defer runutil.CloseWithLogOnErr(logger, fromBkt, "from bucket client")
 		defer runutil.CloseWithLogOnErr(logger, toBkt, "to bucket client")
 
-		if singleRun {
+		if singleRun || len(blockIDs) > 0 {
 			return replicateFn()
 		}
 

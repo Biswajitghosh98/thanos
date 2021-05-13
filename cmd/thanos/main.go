@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"syscall"
 
 	"github.com/go-kit/kit/log"
@@ -28,12 +29,16 @@ import (
 )
 
 func main() {
+	// We use mmaped resources in most of the components so hardcode PanicOnFault to true. This allows us to recover (if we can e.g if queries
+	// are temporarily accessing unmapped memory).
+	debug.SetPanicOnFault(true)
+
 	if os.Getenv("DEBUG") != "" {
 		runtime.SetMutexProfileFraction(10)
 		runtime.SetBlockProfileRate(10)
 	}
 
-	app := extkingpin.NewApp(kingpin.New(filepath.Base(os.Args[0]), "A block storage based long-term storage for Prometheus").Version(version.Print("thanos")))
+	app := extkingpin.NewApp(kingpin.New(filepath.Base(os.Args[0]), "A block storage based long-term storage for Prometheus.").Version(version.Print("thanos")))
 	debugName := app.Flag("debug.name", "Name to add as prefix to log lines.").Hidden().String()
 	logLevel := app.Flag("log.level", "Log filtering level.").
 		Default("info").Enum("error", "warn", "info", "debug")
@@ -51,14 +56,7 @@ func main() {
 	registerQueryFrontend(app)
 
 	cmd, setup := app.Parse()
-	logger := logging.NewLogger(*logFormat, *debugName)
-	logger, err := logging.WithLogLevel(logger, *logLevel)
-	if err != nil {
-		// This log line intentionally does not call the error level
-		// explicitly, as the log level configuration failed.
-		logger.Log("level", "error", "err", err)
-		os.Exit(1)
-	}
+	logger := logging.NewLogger(*logLevel, *logFormat, *debugName)
 
 	// Running in container with limits but with empty/wrong value of GOMAXPROCS env var could lead to throttling by cpu
 	// maxprocs will automate adjustment by using cgroups info about cpu limit if it set as value for runtime.GOMAXPROCS.
@@ -97,7 +95,6 @@ func main() {
 		}
 
 		if len(confContentYaml) == 0 {
-			level.Info(logger).Log("msg", "Tracing will be disabled")
 			tracer = client.NoopTracer()
 		} else {
 			tracer, closer, err = client.NewTracer(ctx, logger, metrics, confContentYaml)

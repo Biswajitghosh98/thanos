@@ -6,7 +6,6 @@ package compact
 import (
 	"testing"
 
-	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/tsdb"
 
@@ -34,11 +33,11 @@ func TestHaltMultiError(t *testing.T) {
 	nonHaltErr := errors.New("not a halt error")
 
 	errs := errutil.MultiError{nonHaltErr}
-	testutil.Assert(t, !IsHaltError(errs), "should not be a halt error")
+	testutil.Assert(t, !IsHaltError(errs.Err()), "should not be a halt error")
 
 	errs.Add(haltErr)
-	testutil.Assert(t, IsHaltError(errs), "if any halt errors are present this should return true")
-	testutil.Assert(t, IsHaltError(errors.Wrap(errs, "wrap")), "halt error with wrap")
+	testutil.Assert(t, IsHaltError(errs.Err()), "if any halt errors are present this should return true")
+	testutil.Assert(t, IsHaltError(errors.Wrap(errs.Err(), "wrap")), "halt error with wrap")
 
 }
 
@@ -47,15 +46,15 @@ func TestRetryMultiError(t *testing.T) {
 	nonRetryErr := errors.New("not a retry error")
 
 	errs := errutil.MultiError{nonRetryErr}
-	testutil.Assert(t, !IsRetryError(errs), "should not be a retry error")
+	testutil.Assert(t, !IsRetryError(errs.Err()), "should not be a retry error")
 
 	errs = errutil.MultiError{retryErr}
-	testutil.Assert(t, IsRetryError(errs), "if all errors are retriable this should return true")
+	testutil.Assert(t, IsRetryError(errs.Err()), "if all errors are retriable this should return true")
 
-	testutil.Assert(t, IsRetryError(errors.Wrap(errs, "wrap")), "retry error with wrap")
+	testutil.Assert(t, IsRetryError(errors.Wrap(errs.Err(), "wrap")), "retry error with wrap")
 
 	errs = errutil.MultiError{nonRetryErr, retryErr}
-	testutil.Assert(t, !IsRetryError(errs), "mixed errors should return false")
+	testutil.Assert(t, !IsRetryError(errs.Err()), "mixed errors should return false")
 }
 
 func TestRetryError(t *testing.T) {
@@ -116,20 +115,12 @@ func TestGroupKey(t *testing.T) {
 
 func TestGroupMaxMinTime(t *testing.T) {
 	g := &Group{
-		blocks: make(map[ulid.ULID]*metadata.Meta),
+		metasByMinTime: []*metadata.Meta{
+			{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 10}},
+			{BlockMeta: tsdb.BlockMeta{MinTime: 1, MaxTime: 20}},
+			{BlockMeta: tsdb.BlockMeta{MinTime: 2, MaxTime: 30}},
+		},
 	}
-
-	now := ulid.Now()
-	id1, err := ulid.New(now, nil)
-	testutil.Ok(t, err)
-	id2, err := ulid.New(now-10, nil)
-	testutil.Ok(t, err)
-	id3, err := ulid.New(now+10, nil)
-	testutil.Ok(t, err)
-
-	g.blocks[id1] = &metadata.Meta{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 10}}
-	g.blocks[id2] = &metadata.Meta{BlockMeta: tsdb.BlockMeta{MinTime: 1, MaxTime: 20}}
-	g.blocks[id3] = &metadata.Meta{BlockMeta: tsdb.BlockMeta{MinTime: 2, MaxTime: 30}}
 
 	testutil.Equals(t, int64(0), g.MinTime())
 	testutil.Equals(t, int64(30), g.MaxTime())

@@ -49,20 +49,21 @@ func NewThanosLabelsCodec(partialResponse bool, defaultMetadataTimeRange time.Du
 	}
 }
 
+// MergeResponse merges multiple responses into a single Response. It needs to dedup the responses and ensure the order.
 func (c labelsCodec) MergeResponse(responses ...queryrange.Response) (queryrange.Response, error) {
 	if len(responses) == 0 {
+		// Empty response for label_names, label_values and series API.
 		return &ThanosLabelsResponse{
 			Status: queryrange.StatusSuccess,
 			Data:   []string{},
 		}, nil
 	}
 
-	if len(responses) == 1 {
-		return responses[0], nil
-	}
-
 	switch responses[0].(type) {
 	case *ThanosLabelsResponse:
+		if len(responses) == 1 {
+			return responses[0], nil
+		}
 		set := make(map[string]struct{})
 
 		for _, res := range responses {
@@ -83,25 +84,20 @@ func (c labelsCodec) MergeResponse(responses ...queryrange.Response) (queryrange
 			Data:   lbls,
 		}, nil
 	case *ThanosSeriesResponse:
-		seriesData := make([]labelpb.LabelSet, 0)
+		seriesData := make(labelpb.ZLabelSets, 0)
 
-		// seriesString is used in soring so we don't have to calculate the string of label sets again.
-		seriesString := make([]string, 0)
 		uniqueSeries := make(map[string]struct{})
 		for _, res := range responses {
 			for _, series := range res.(*ThanosSeriesResponse).Data {
-				s := labelpb.LabelsToPromLabels(series.Labels).String()
+				s := series.PromLabels().String()
 				if _, ok := uniqueSeries[s]; !ok {
 					seriesData = append(seriesData, series)
-					seriesString = append(seriesString, s)
 					uniqueSeries[s] = struct{}{}
 				}
 			}
 		}
 
-		sort.Slice(seriesData, func(i, j int) bool {
-			return seriesString[i] < seriesString[j]
-		})
+		sort.Sort(seriesData)
 		return &ThanosSeriesResponse{
 			Status: queryrange.StatusSuccess,
 			Data:   seriesData,
@@ -134,7 +130,8 @@ func (c labelsCodec) DecodeRequest(_ context.Context, r *http.Request) (queryran
 }
 
 func (c labelsCodec) EncodeRequest(ctx context.Context, r queryrange.Request) (*http.Request, error) {
-	var u *url.URL
+	var req *http.Request
+	var err error
 	switch thanosReq := r.(type) {
 	case *ThanosLabelsRequest:
 		var params = url.Values{
@@ -145,10 +142,28 @@ func (c labelsCodec) EncodeRequest(ctx context.Context, r queryrange.Request) (*
 		if len(thanosReq.StoreMatchers) > 0 {
 			params[queryv1.StoreMatcherParam] = matchersToStringSlice(thanosReq.StoreMatchers)
 		}
-		u = &url.URL{
-			Path:     thanosReq.Path,
-			RawQuery: params.Encode(),
+
+		if strings.Contains(thanosReq.Path, "/api/v1/label/") {
+			u := &url.URL{
+				Path:     thanosReq.Path,
+				RawQuery: params.Encode(),
+			}
+
+			req = &http.Request{
+				Method:     http.MethodGet,
+				RequestURI: u.String(), // This is what the httpgrpc code looks at.
+				URL:        u,
+				Body:       http.NoBody,
+				Header:     http.Header{},
+			}
+		} else {
+			req, err = http.NewRequest(http.MethodPost, thanosReq.Path, bytes.NewBufferString(params.Encode()))
+			if err != nil {
+				return nil, httpgrpc.Errorf(http.StatusBadRequest, "error creating request: %s", err.Error())
+			}
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
+
 	case *ThanosSeriesRequest:
 		var params = url.Values{
 			"start":                      []string{encodeTime(thanosReq.Start)},
@@ -163,20 +178,15 @@ func (c labelsCodec) EncodeRequest(ctx context.Context, r queryrange.Request) (*
 		if len(thanosReq.StoreMatchers) > 0 {
 			params[queryv1.StoreMatcherParam] = matchersToStringSlice(thanosReq.StoreMatchers)
 		}
-		u = &url.URL{
-			Path:     thanosReq.Path,
-			RawQuery: params.Encode(),
+
+		req, err = http.NewRequest(http.MethodPost, thanosReq.Path, bytes.NewBufferString(params.Encode()))
+		if err != nil {
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, "error creating request: %s", err.Error())
 		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
 	default:
 		return nil, httpgrpc.Errorf(http.StatusInternalServerError, "invalid request format")
-	}
-
-	req := &http.Request{
-		Method:     "GET",
-		RequestURI: u.String(), // This is what the httpgrpc code looks at.
-		URL:        u,
-		Body:       http.NoBody,
-		Header:     http.Header{},
 	}
 
 	return req.WithContext(ctx), nil
@@ -187,7 +197,7 @@ func (c labelsCodec) DecodeResponse(ctx context.Context, r *http.Response, req q
 		body, _ := ioutil.ReadAll(r.Body)
 		return nil, httpgrpc.Errorf(r.StatusCode, string(body))
 	}
-	log, ctx := spanlogger.New(ctx, "ParseQueryResponse") //nolint:ineffassign,staticcheck
+	log, _ := spanlogger.New(ctx, "ParseQueryResponse") //nolint:ineffassign,staticcheck
 	defer log.Finish()
 
 	buf, err := ioutil.ReadAll(r.Body)
@@ -273,7 +283,7 @@ func (c labelsCodec) parseLabelsRequest(r *http.Request, op string) (queryrange.
 		return nil, err
 	}
 
-	result.StoreMatchers, err = parseMatchersParam(r.Form[queryv1.StoreMatcherParam])
+	result.StoreMatchers, err = parseMatchersParam(r.Form, queryv1.StoreMatcherParam)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +317,7 @@ func (c labelsCodec) parseSeriesRequest(r *http.Request) (queryrange.Request, er
 		return nil, err
 	}
 
-	result.Matchers, err = parseMatchersParam(r.Form[queryv1.MatcherParam])
+	result.Matchers, err = parseMatchersParam(r.Form, queryv1.MatcherParam)
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +336,7 @@ func (c labelsCodec) parseSeriesRequest(r *http.Request) (queryrange.Request, er
 		result.ReplicaLabels = r.Form[queryv1.ReplicaLabelsParam]
 	}
 
-	result.StoreMatchers, err = parseMatchersParam(r.Form[queryv1.StoreMatcherParam])
+	result.StoreMatchers, err = parseMatchersParam(r.Form, queryv1.StoreMatcherParam)
 	if err != nil {
 		return nil, err
 	}

@@ -4,13 +4,15 @@
 package receive
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io/ioutil"
+	"io"
 	stdlog "log"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -56,8 +58,8 @@ const (
 )
 
 var (
-	// conflictErr is returned whenever an operation fails due to any conflict-type error.
-	conflictErr = errors.New("conflict")
+	// errConflict is returned whenever an operation fails due to any conflict-type error.
+	errConflict = errors.New("conflict")
 
 	errBadReplica  = errors.New("replica count exceeds replication factor")
 	errNotReady    = errors.New("target not ready")
@@ -149,15 +151,18 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 
 	ins := extpromhttp.NewNopInstrumentationMiddleware()
 	if o.Registry != nil {
-		ins = extpromhttp.NewInstrumentationMiddleware(o.Registry)
+		ins = extpromhttp.NewInstrumentationMiddleware(o.Registry,
+			[]float64{0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4, 5},
+		)
 	}
 
 	readyf := h.testReady
 	instrf := func(name string, next func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
+		next = ins.NewHandler(name, http.HandlerFunc(next))
 		if o.Tracer != nil {
 			next = tracing.HTTPMiddleware(o.Tracer, name, logger, http.HandlerFunc(next))
 		}
-		return ins.NewHandler(name, http.HandlerFunc(next))
+		return next
 	}
 
 	h.router.Post("/api/v1/receive", instrf("receive", readyf(middleware.RequestID(http.HandlerFunc(h.receiveHTTP)))))
@@ -261,7 +266,7 @@ func (h *Handler) handleRequest(ctx context.Context, rep uint64, tenant string, 
 		replicated: rep != 0,
 	}
 
-	// on-the-wire format is 1-indexed and in-code is 0-indexed so we decrement the value if it was already replicated.
+	// On the wire, format is 1-indexed and in-code is 0-indexed so we decrement the value if it was already replicated.
 	if r.replicated {
 		r.n--
 	}
@@ -269,32 +274,37 @@ func (h *Handler) handleRequest(ctx context.Context, rep uint64, tenant string, 
 	// Forward any time series as necessary. All time series
 	// destined for the local node will be written to the receiver.
 	// Time series will be replicated as necessary.
-	if err := h.forward(ctx, tenant, r, wreq); err != nil {
-		if countCause(err, isConflict) > 0 {
-			return conflictErr
-		}
-		return err
-	}
-	return nil
+	return h.forward(ctx, tenant, r, wreq)
 }
 
 func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	span, ctx := tracing.StartSpan(r.Context(), "receive_http")
 	defer span.Finish()
 
-	compressed, err := ioutil.ReadAll(r.Body)
+	// ioutil.ReadAll dynamically adjust the byte slice for read data, starting from 512B.
+	// Since this is receive hot path, grow upfront saving allocations and CPU time.
+	compressed := bytes.Buffer{}
+	if r.ContentLength >= 0 {
+		compressed.Grow(int(r.ContentLength))
+	} else {
+		compressed.Grow(512)
+	}
+	_, err := io.Copy(&compressed, r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, errors.Wrap(err, "read compressed request body").Error(), http.StatusInternalServerError)
 		return
 	}
 
-	reqBuf, err := snappy.Decode(nil, compressed)
+	reqBuf, err := snappy.Decode(nil, compressed.Bytes())
 	if err != nil {
 		level.Error(h.logger).Log("msg", "snappy decode error", "err", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, errors.Wrap(err, "snappy decode error").Error(), http.StatusBadRequest)
 		return
 	}
 
+	// NOTE: Due to zero copy ZLabels, Labels used from WriteRequests keeps memory
+	// from the whole request. Ensure that we always copy those when we want to
+	// store them for longer time.
 	var wreq prompb.WriteRequest
 	if err := proto.Unmarshal(reqBuf, &wreq); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -315,15 +325,25 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 		tenant = h.options.DefaultTenantID
 	}
 
+	// Exit early if the request contained no data.
+	if len(wreq.Timeseries) == 0 {
+		level.Info(h.logger).Log("msg", "empty timeseries from client", "tenant", tenant)
+		return
+	}
+
 	err = h.handleRequest(ctx, rep, tenant, &wreq)
-	switch err {
+	if err != nil {
+		level.Debug(h.logger).Log("msg", "failed to handle request", "err", err)
+	}
+
+	switch determineWriteErrorCause(err, 1) {
 	case nil:
 		return
 	case errNotReady:
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	case errUnavailable:
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-	case conflictErr:
+	case errConflict:
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errBadReplica:
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -401,9 +421,9 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 		}
 	}()
 
-	logger := log.With(h.logger, "tenant", tenant)
+	logTags := []interface{}{"tenant", tenant}
 	if id, ok := middleware.RequestIDFromContext(pctx); ok {
-		logger = log.With(logger, "request-id", id)
+		logTags = append(logTags, "request-id", id)
 	}
 
 	ec := make(chan error)
@@ -425,7 +445,7 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 				})
 				if err != nil {
 					h.replications.WithLabelValues(labelError).Inc()
-					ec <- errors.Wrapf(err, "replicate write request, endpoint %v", endpoint)
+					ec <- errors.Wrapf(err, "replicate write request for endpoint %v", endpoint)
 					return
 				}
 
@@ -453,16 +473,8 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 				if err != nil {
 					// When a MultiError is added to another MultiError, the error slices are concatenated, not nested.
 					// To avoid breaking the counting logic, we need to flatten the error.
-					if errs, ok := err.(errutil.MultiError); ok {
-						if countCause(errs, isConflict) > 0 {
-							err = errors.Wrap(conflictErr, errs.Error())
-						} else if countCause(errs, isNotReady) > 0 {
-							err = errNotReady
-						} else {
-							err = errors.New(errs.Error())
-						}
-					}
-					ec <- errors.Wrapf(err, "storing locally, endpoint %v", endpoint)
+					level.Debug(h.logger).Log(append(logTags, "msg", "local tsdb write failed", "err", err.Error()))
+					ec <- errors.Wrapf(determineWriteErrorCause(err, 1), "store locally for endpoint %v", endpoint)
 					return
 				}
 				ec <- nil
@@ -524,7 +536,7 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 							b.attempt++
 							dur := h.expBackoff.ForAttempt(b.attempt)
 							b.nextAllowed = time.Now().Add(dur)
-							level.Debug(h.logger).Log("msg", "target unavailable backing off", "for", dur)
+							level.Debug(h.logger).Log(append(logTags, "msg", "target unavailable backing off", "for", dur))
 						} else {
 							h.peerStates[endpoint] = &retryState{nextAllowed: time.Now().Add(h.expBackoff.ForAttempt(0))}
 						}
@@ -553,7 +565,7 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 		go func() {
 			for err := range ec {
 				if err != nil {
-					level.Debug(logger).Log("msg", "request failed, but not needed to achieve quorum", "err", err)
+					level.Debug(h.logger).Log(append(logTags, "msg", "request failed, but not needed to achieve quorum", "err", err))
 				}
 			}
 		}()
@@ -566,7 +578,7 @@ func (h *Handler) fanoutForward(pctx context.Context, tenant string, replicas ma
 			return fctx.Err()
 		case err, more := <-ec:
 			if !more {
-				return errs
+				return errs.Err()
 			}
 			if err == nil {
 				success++
@@ -614,18 +626,8 @@ func (h *Handler) replicate(ctx context.Context, tenant string, wreq *prompb.Wri
 	quorum := h.writeQuorum()
 	// fanoutForward only returns an error if successThreshold (quorum) is not reached.
 	if err := h.fanoutForward(ctx, tenant, replicas, wreqs, quorum); err != nil {
-		if countCause(err, isNotReady) >= quorum {
-			return errors.Wrap(errNotReady, "replicate: quorum not reached")
-		}
-		if countCause(err, isConflict) >= quorum {
-			return errors.Wrap(conflictErr, "replicate: quorum not reached")
-		}
-		if countCause(err, isUnavailable) >= quorum {
-			return errors.Wrap(errUnavailable, "replicate: quorum not reached")
-		}
-		return errors.Wrap(err, "unexpected error, before quorum is reached")
+		return errors.Wrap(determineWriteErrorCause(err, quorum), "quorum not reached")
 	}
-
 	return nil
 }
 
@@ -635,14 +637,17 @@ func (h *Handler) RemoteWrite(ctx context.Context, r *storepb.WriteRequest) (*st
 	defer span.Finish()
 
 	err := h.handleRequest(ctx, uint64(r.Replica), r.Tenant, &prompb.WriteRequest{Timeseries: r.Timeseries})
-	switch err {
+	if err != nil {
+		level.Debug(h.logger).Log("msg", "failed to handle request", "err", err)
+	}
+	switch determineWriteErrorCause(err, 1) {
 	case nil:
 		return &storepb.WriteResponse{}, nil
 	case errNotReady:
 		return nil, status.Error(codes.Unavailable, err.Error())
 	case errUnavailable:
 		return nil, status.Error(codes.Unavailable, err.Error())
-	case conflictErr:
+	case errConflict:
 		return nil, status.Error(codes.AlreadyExists, err.Error())
 	case errBadReplica:
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -651,34 +656,15 @@ func (h *Handler) RemoteWrite(ctx context.Context, r *storepb.WriteRequest) (*st
 	}
 }
 
-// countCause counts the number of errors within the given error
-// whose causes satisfy the given function.
-// countCause will inspect the error's cause or, if the error is a MultiError,
-// the cause of each contained error but will not traverse any deeper.
-func countCause(err error, f func(error) bool) int {
-	errs, ok := err.(errutil.MultiError)
-	if !ok {
-		errs = []error{err}
-	}
-	var n int
-	for i := range errs {
-		if f(errors.Cause(errs[i])) {
-			n++
-		}
-	}
-	return n
-}
-
 // isConflict returns whether or not the given error represents a conflict.
 func isConflict(err error) bool {
 	if err == nil {
 		return false
 	}
-	return err == conflictErr ||
+	return err == errConflict ||
 		err == storage.ErrDuplicateSampleForTimestamp ||
 		err == storage.ErrOutOfOrderSample ||
 		err == storage.ErrOutOfBounds ||
-		err.Error() == strconv.Itoa(http.StatusConflict) ||
 		status.Code(err) == codes.AlreadyExists
 }
 
@@ -700,6 +686,59 @@ func isUnavailable(err error) bool {
 type retryState struct {
 	attempt     float64
 	nextAllowed time.Time
+}
+
+type expectedErrors []*struct {
+	err   error
+	cause func(error) bool
+	count int
+}
+
+func (a expectedErrors) Len() int           { return len(a) }
+func (a expectedErrors) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a expectedErrors) Less(i, j int) bool { return a[i].count < a[j].count }
+
+// determineWriteErrorCause extracts a sentinel error that has occurred more than the given threshold from a given fan-out error.
+// It will inspect the error's cause if the error is a MultiError,
+// It will return cause of each contained error but will not traverse any deeper.
+func determineWriteErrorCause(err error, threshold int) error {
+	if err == nil {
+		return nil
+	}
+
+	unwrappedErr := errors.Cause(err)
+	errs, ok := unwrappedErr.(errutil.NonNilMultiError)
+	if !ok {
+		errs = []error{unwrappedErr}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+
+	if threshold < 1 {
+		return err
+	}
+
+	expErrs := expectedErrors{
+		{err: errConflict, cause: isConflict},
+		{err: errNotReady, cause: isNotReady},
+		{err: errUnavailable, cause: isUnavailable},
+	}
+	for _, exp := range expErrs {
+		exp.count = 0
+		for _, err := range errs {
+			if exp.cause(errors.Cause(err)) {
+				exp.count++
+			}
+		}
+	}
+	// Determine which error occurred most.
+	sort.Sort(sort.Reverse(expErrs))
+	if exp := expErrs[0]; exp.count >= threshold {
+		return exp.err
+	}
+
+	return err
 }
 
 func newPeerGroup(dialOpts ...grpc.DialOption) *peerGroup {
