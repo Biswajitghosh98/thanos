@@ -279,6 +279,40 @@ func NewDefaultGrouper(
 	}
 }
 
+//HashFuncPrimes store the 16 prime numbers used for calculating rolling hash for sharding.
+var HashFuncPrimes []int64 = []int64{31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101}
+
+//HashFuncMod is a large prime number which is the Modulus value for the rolling hash.
+const HashFuncMod int64 = 104729
+
+//FastPower calculates "a raised to the power b mod HashFuncMod, or (a^b)%HashFuncMod" in O(ln b).
+func FastPower(a, b int64) int64 {
+	a %= HashFuncMod
+	var res int64 = 1
+	for b > 0 {
+		if b%2 == 1 {
+			res = (res * a) % HashFuncMod
+		}
+		a = (a * a) % HashFuncMod
+		b = b / 2
+	}
+	return res
+}
+
+func ComputeMetricHash(metricName string, shardLevel int64) int64 {
+	var temp int64 = 0
+	for i, x := range metricName {
+		temp += int64(x) * FastPower(HashFuncPrimes[shardLevel], int64(i))
+		temp %= HashFuncMod
+	}
+	var ans int64 = 0
+	for temp > 0 {
+		ans += temp % 10
+		temp /= 10
+	}
+	return ans % 2
+}
+
 // Groups returns the compaction groups for all blocks currently known to the syncer.
 // It creates all groups from the scratch on every call.
 func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Group, err error) {
